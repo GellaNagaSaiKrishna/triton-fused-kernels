@@ -20,8 +20,27 @@ OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 os.makedirs(OUT, exist_ok=True)
 
 
-def ms(fn):
-    return triton.testing.do_bench(fn, warmup=25, rep=100)
+ERRORS = []
+
+
+def ms(fn, label="?"):
+    """Time fn; on failure record the error and return NaN so the run continues."""
+    try:
+        return triton.testing.do_bench(fn, warmup=25, rep=100)
+    except Exception as e:  # noqa: BLE001 - we want every failure reported, not a crash
+        msg = f"{label}: {type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"
+        print("FAILED", msg)
+        ERRORS.append(msg)
+        return float("nan")
+
+
+def safe_compile(fn):
+    """torch.compile can fail on some GPU/driver combos; fall back to eager and say so."""
+    try:
+        return torch.compile(fn)
+    except Exception as e:  # noqa: BLE001
+        ERRORS.append(f"torch.compile unavailable: {type(e).__name__}: {e}")
+        return fn
 
 
 def gbps(nbytes, t_ms):
@@ -29,35 +48,33 @@ def gbps(nbytes, t_ms):
 
 
 def bench_bias_gelu():
-    compiled = torch.compile(bias_gelu_reference)
+    compiled = safe_compile(bias_gelu_reference)
     rows = []
     for n_rows in [1024, 4096, 16384, 65536]:
         n_cols = 4096
         x = torch.randn(n_rows, n_cols, device=DEV, dtype=DT)
         b = torch.randn(n_cols, device=DEV, dtype=DT)
-        compiled(x, b)  # trigger compilation outside the timed region
         nbytes = 2 * x.numel() * x.element_size()  # ideal: read x once, write y once
         for name, fn in [("pytorch_unfused", lambda: bias_gelu_reference(x, b)),
                          ("torch_compile", lambda: compiled(x, b)),
                          ("triton_fused", lambda: fused_bias_gelu(x, b))]:
-            t = ms(fn)
+            t = ms(fn, f"bias_gelu {n_rows}x{n_cols} {name}")
             rows.append(dict(op="bias_gelu", shape=f"{n_rows}x{n_cols}", impl=name, ms=t, gbps=gbps(nbytes, t)))
     return rows
 
 
 def bench_softmax():
-    compiled = torch.compile(softmax_naive)
+    compiled = safe_compile(softmax_naive)
     rows = []
     for n_cols in [512, 1024, 2048, 4096, 8192]:
         n_rows = 8192
         x = torch.randn(n_rows, n_cols, device=DEV, dtype=DT)
-        compiled(x)
         nbytes = 2 * x.numel() * x.element_size()
         for name, fn in [("pytorch_naive_5ops", lambda: softmax_naive(x)),
                          ("torch_softmax", lambda: torch.softmax(x, dim=1)),
                          ("torch_compile", lambda: compiled(x)),
                          ("triton_fused", lambda: fused_softmax(x))]:
-            t = ms(fn)
+            t = ms(fn, f"softmax {n_rows}x{n_cols} {name}")
             rows.append(dict(op="softmax", shape=f"{n_rows}x{n_cols}", impl=name, ms=t, gbps=gbps(nbytes, t)))
     return rows
 
@@ -81,11 +98,15 @@ def write(rows):
                 r = next(r for r in rows if r["op"] == op and r["shape"] == shape and r["impl"] == i)
                 cells.append(f"{r['ms']:.3f} ({r['gbps']:.0f})")
             lines.append(f"| {shape} | " + " | ".join(cells) + " |")
+    if ERRORS:
+        lines.append("\n## Errors (nan above = this implementation failed)\n")
+        lines += [f"- {e}" for e in ERRORS]
     with open(os.path.join(OUT, "RESULTS.md"), "w") as f:
         f.write("\n".join(lines) + "\n")
     print("\n".join(lines))
 
 
 if __name__ == "__main__":
-    print("GPU:", torch.cuda.get_device_name())
+    print("GPU:", torch.cuda.get_device_name(), "| capability", torch.cuda.get_device_capability(),
+          "| torch", torch.__version__, "| triton", triton.__version__)
     write(bench_bias_gelu() + bench_softmax())
